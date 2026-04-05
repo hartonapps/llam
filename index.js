@@ -1,15 +1,8 @@
 import 'dotenv/config';
-import fs from 'fs';
-import path from 'path';
 import fetch from 'node-fetch';
 import { Telegraf } from 'telegraf';
-import { fileURLToPath } from 'url';
 
-// Resolve directory in ES module mode
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Environment configuration
+// Read environment variables from .env
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const AI_ENDPOINT = process.env.AI_ENDPOINT;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
@@ -17,341 +10,111 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .map((id) => id.trim())
   .filter(Boolean);
 
-if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN in .env');
-if (!AI_ENDPOINT) throw new Error('Missing AI_ENDPOINT in .env');
-
-// Project folders/files
-const logsDir = path.join(__dirname, 'logs');
-const dataDir = path.join(__dirname, 'data');
-const usersJsonPath = path.join(dataDir, 'users.json');
-
-// Ensure required directories and profile file exist
-function ensureStorage() {
-  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-  if (!fs.existsSync(usersJsonPath)) fs.writeFileSync(usersJsonPath, '{}\n', 'utf8');
+if (!TELEGRAM_TOKEN) {
+  throw new Error('Missing TELEGRAM_TOKEN in .env');
 }
 
-// Read user profile JSON safely
-function readUsersData() {
-  try {
-    const raw = fs.readFileSync(usersJsonPath, 'utf8');
-    return JSON.parse(raw || '{}');
-  } catch (error) {
-    console.error('Error reading users.json:', error.message);
-    return {};
-  }
+if (!AI_ENDPOINT) {
+  throw new Error('Missing AI_ENDPOINT in .env');
 }
 
-// Persist user profile JSON safely
-function writeUsersData(data) {
-  fs.writeFileSync(usersJsonPath, JSON.stringify(data, null, 2), 'utf8');
-}
+const bot = new Telegraf(TELEGRAM_TOKEN);
 
-// Return YYYY-MM-DD
-function todayDate() {
-  return new Date().toISOString().slice(0, 10);
-}
+// In-memory stats storage
+const userIds = new Set();
+let totalMessages = 0;
 
-// Return YYYY-MM-DD HH:MM
-function nowLogTimestamp() {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  const hh = String(now.getHours()).padStart(2, '0');
-  const mm = String(now.getMinutes()).padStart(2, '0');
-  return `${y}-${m}-${d} ${hh}:${mm}`;
-}
-
+// Helper to check whether a Telegram user is an admin
 function isAdmin(userId) {
   return ADMIN_IDS.includes(String(userId));
 }
 
-// Keep runtime stats in memory
-const userIds = new Set();
-let totalMessages = 0;
-
-function registerUser(ctx) {
-  const userId = ctx.from?.id;
-  if (!userId) return null;
-
-  userIds.add(userId);
-
-  const users = readUsersData();
-  const key = String(userId);
-
-  if (!users[key]) {
-    users[key] = {
-      name: ctx.from?.first_name || 'Unknown',
-      messages: 0,
-      joined: todayDate()
-    };
-    writeUsersData(users);
-  }
-
-  return userId;
-}
-
-function incrementUserMessageCount(userId) {
-  if (!userId) return;
-
-  const users = readUsersData();
-  const key = String(userId);
-
-  if (!users[key]) {
-    users[key] = {
-      name: 'Unknown',
-      messages: 0,
-      joined: todayDate()
-    };
-  }
-
-  users[key].messages += 1;
-  writeUsersData(users);
-}
-
-// Save user/AI chat history without database
-function saveChatLog(userId, userText, aiText) {
-  if (!userId) return;
-
-  const logPath = path.join(logsDir, `chat_${userId}.log`);
-  const entry = `[${nowLogTimestamp()}]\nUser: ${userText}\nAI: ${aiText}\n\n`;
-
-  fs.appendFile(logPath, entry, 'utf8', (error) => {
-    if (error) {
-      console.error('Error saving chat log:', error.message);
-      return;
-    }
-    console.log(`Saved chat log for user ${userId}`);
-  });
-}
-
-// Read a user's chat history from log file so it can be sent to AI context
-function getUserChatHistory(userId, maxChars = 6000) {
-  if (!userId) return '';
-
-  const logPath = path.join(logsDir, `chat_${userId}.log`);
-  if (!fs.existsSync(logPath)) return '';
-
-  try {
-    const fullLog = fs.readFileSync(logPath, 'utf8');
-    if (!fullLog) return '';
-
-    // Keep only the most recent section to avoid very large payloads
-    return fullLog.slice(-maxChars);
-  } catch (error) {
-    console.error(`Error reading chat history for ${userId}:`, error.message);
-    return '';
-  }
-}
-
-// Try to find an exact previous question in log and reuse its AI answer
-function findCachedAnswer(userId, question) {
-  if (!userId || !question) return null;
-
-  const logPath = path.join(logsDir, `chat_${userId}.log`);
-  if (!fs.existsSync(logPath)) return null;
-
-  try {
-    const text = fs.readFileSync(logPath, 'utf8');
-    const entries = text
-      .split('\n\n')
-      .map((entry) => entry.trim())
-      .filter(Boolean);
-
-    // Search newest first for efficiency
-    for (let i = entries.length - 1; i >= 0; i -= 1) {
-      const userMatch = entries[i].match(/User:\s*([\s\S]*?)\nAI:/);
-      const aiMatch = entries[i].match(/\nAI:\s*([\s\S]*)$/);
-
-      const previousUserText = userMatch?.[1]?.trim();
-      const previousAiText = aiMatch?.[1]?.trim();
-
-      if (
-        previousUserText &&
-        previousAiText &&
-        previousUserText.toLowerCase() === question.toLowerCase()
-      ) {
-        return previousAiText;
-      }
-    }
-  } catch (error) {
-    console.error(`Error reading cached answer for ${userId}:`, error.message);
-  }
-
-  return null;
-}
-
-ensureStorage();
-
-const bot = new Telegraf(TELEGRAM_TOKEN);
-
+// /start command
 bot.start((ctx) => {
-  const userId = registerUser(ctx);
-  console.log(`New user: ${userId}`);
-  return ctx.reply('👋 Welcome! Send me any message to chat with AI. Use /help for commands.');
+  if (ctx.from?.id) userIds.add(ctx.from.id);
+
+  return ctx.reply(
+    '👋 Welcome! Send me any text and I will ask the AI for a response.\nUse /help to see commands.'
+  );
 });
 
+// /help command
 bot.help((ctx) => {
-  registerUser(ctx);
-  return ctx.reply([
-    'Available commands:',
-    '/start - Start bot',
-    '/help - Show help',
-    '/profile - Show your profile',
-    '/setname <name> - Set your display name'
-  ].join('\n'));
+  if (ctx.from?.id) userIds.add(ctx.from.id);
+
+  return ctx.reply(
+    [
+      'Available commands:',
+      '/start - Start the bot',
+      '/help - Show this help message',
+      '/stats - Show bot stats (admin only)',
+      '/broadcast <message> - Send a message to all users (admin only)',
+      '',
+      'You can also just send any text message to chat with the AI.'
+    ].join('\n')
+  );
 });
 
-bot.command('profile', (ctx) => {
-  const userId = registerUser(ctx);
-  const users = readUsersData();
-  const profile = users[String(userId)];
+// /stats command (admin only)
+bot.command('stats', (ctx) => {
+  if (ctx.from?.id) userIds.add(ctx.from.id);
 
-  if (!profile) return ctx.reply('Profile not found. Send a message first.');
-
-  return ctx.reply([
-    '👤 Your profile',
-    `ID: ${userId}`,
-    `Name: ${profile.name}`,
-    `Messages: ${profile.messages}`,
-    `Joined: ${profile.joined}`
-  ].join('\n'));
-});
-
-bot.command('setname', (ctx) => {
-  const userId = registerUser(ctx);
-  const text = ctx.message?.text || '';
-  const newName = text.replace(/^\/setname\s*/i, '').trim();
-
-  if (!newName) return ctx.reply('Usage: /setname <name>');
-
-  const users = readUsersData();
-  const key = String(userId);
-
-  if (!users[key]) {
-    users[key] = { name: newName, messages: 0, joined: todayDate() };
-  } else {
-    users[key].name = newName;
+  if (!ctx.from?.id || !isAdmin(ctx.from.id)) {
+    return ctx.reply('⛔ You are not authorized to use this command.');
   }
 
-  writeUsersData(users);
-  return ctx.reply(`✅ Name updated to: ${newName}`);
+  return ctx.reply(
+    `📊 Bot stats\nTotal users: ${userIds.size}\nTotal messages: ${totalMessages}`
+  );
 });
 
-// Admin commands
-bot.command('adminhelp', (ctx) => {
-  registerUser(ctx);
-  if (!ctx.from?.id || !isAdmin(ctx.from.id)) return ctx.reply('⛔ Admin only.');
-
-  return ctx.reply([
-    '🛠 Admin commands:',
-    '/stats - Show users/messages stats',
-    '/users - Show total users',
-    '/broadcast <message> - Send message to all users',
-    '/log <userid> - Send chat log file',
-    '/restart - Restart bot'
-  ].join('\n'));
-});
-
-bot.command('stats', (ctx) => {
-  registerUser(ctx);
-  if (!ctx.from?.id || !isAdmin(ctx.from.id)) return ctx.reply('⛔ Admin only.');
-
-  return ctx.reply(`📊 Stats\nTotal users: ${userIds.size}\nTotal messages: ${totalMessages}`);
-});
-
-bot.command('users', (ctx) => {
-  registerUser(ctx);
-  if (!ctx.from?.id || !isAdmin(ctx.from.id)) return ctx.reply('⛔ Admin only.');
-
-  return ctx.reply(`👥 Total users: ${userIds.size}`);
-});
-
+// /broadcast command (admin only)
 bot.command('broadcast', async (ctx) => {
-  registerUser(ctx);
-  if (!ctx.from?.id || !isAdmin(ctx.from.id)) return ctx.reply('⛔ Admin only.');
+  if (ctx.from?.id) userIds.add(ctx.from.id);
 
+  if (!ctx.from?.id || !isAdmin(ctx.from.id)) {
+    return ctx.reply('⛔ You are not authorized to use this command.');
+  }
+
+  // Extract message after command: /broadcast your message here
   const text = ctx.message?.text || '';
   const messageToSend = text.replace(/^\/broadcast\s*/i, '').trim();
-  if (!messageToSend) return ctx.reply('Usage: /broadcast <message>');
 
-  let sent = 0;
-  let failed = 0;
+  if (!messageToSend) {
+    return ctx.reply('Usage: /broadcast <message>');
+  }
 
-  for (const uid of userIds) {
+  let sentCount = 0;
+  let failCount = 0;
+
+  for (const userId of userIds) {
     try {
-      await ctx.telegram.sendMessage(uid, `📢 Broadcast:\n${messageToSend}`);
-      sent += 1;
+      await ctx.telegram.sendMessage(userId, `📢 Broadcast:\n${messageToSend}`);
+      sentCount += 1;
     } catch (error) {
-      failed += 1;
-      console.error(`Broadcast failed for ${uid}:`, error.message);
+      failCount += 1;
+      console.error(`Failed to send broadcast to ${userId}:`, error.message);
     }
   }
 
-  return ctx.reply(`Broadcast complete. Sent: ${sent}, Failed: ${failed}`);
+  return ctx.reply(`Broadcast finished. Sent: ${sentCount}, Failed: ${failCount}`);
 });
 
-bot.command('log', async (ctx) => {
-  registerUser(ctx);
-  if (!ctx.from?.id || !isAdmin(ctx.from.id)) return ctx.reply('⛔ Admin only.');
-
-  const text = ctx.message?.text || '';
-  const targetId = text.replace(/^\/log\s*/i, '').trim();
-
-  if (!targetId) return ctx.reply('Usage: /log <userid>');
-
-  const logPath = path.join(logsDir, `chat_${targetId}.log`);
-  if (!fs.existsSync(logPath)) return ctx.reply(`No log file found for user ${targetId}.`);
-
-  return ctx.replyWithDocument({ source: logPath, filename: `chat_${targetId}.log` });
-});
-
-bot.command('restart', async (ctx) => {
-  registerUser(ctx);
-  if (!ctx.from?.id || !isAdmin(ctx.from.id)) return ctx.reply('⛔ Admin only.');
-
-  await ctx.reply('♻️ Restarting bot...');
-  console.log('Bot restart requested by admin.');
-  setTimeout(() => process.exit(0), 300);
-});
-
-// Main text handler for AI chat
+// Handle all text messages and forward them to the AI endpoint
 bot.on('text', async (ctx) => {
-  const userId = registerUser(ctx);
-
-  // Skip command messages in text handler
-  const incomingText = (ctx.message?.text || '').trim();
-  if (incomingText.startsWith('/')) return;
-
+  if (ctx.from?.id) userIds.add(ctx.from.id);
   totalMessages += 1;
-  incrementUserMessageCount(userId);
+
+  // Skip processing for known commands so they are not sent to AI
+  const incomingText = ctx.message.text.trim();
+  if (incomingText.startsWith('/start') || incomingText.startsWith('/help')) return;
+  if (incomingText.startsWith('/stats') || incomingText.startsWith('/broadcast')) return;
 
   try {
-    // If same question exists in logs, reply instantly from cached history
-    const cachedAnswer = findCachedAnswer(userId, incomingText);
-    if (cachedAnswer) {
-      console.log(`Using cached answer from chat history for user ${userId}`);
-      await ctx.reply(cachedAnswer);
-      return;
-    }
-
-    // Typing animation before request
-    await ctx.sendChatAction('typing');
-
-    // Include previous chat history so AI can answer using earlier context
-    const chatHistory = getUserChatHistory(userId);
-
-    console.log('Sending request to AI API...');
     const response = await fetch(AI_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt: incomingText,
-        userId: String(userId),
-        chat_history: chatHistory
-      })
+      body: JSON.stringify({ prompt: incomingText })
     });
 
     if (!response.ok) {
@@ -359,28 +122,35 @@ bot.on('text', async (ctx) => {
     }
 
     const data = await response.json();
-    console.log('Received response from AI API');
 
-    const aiText = String(
-      data?.response || data?.text || data?.result || data?.message || 'AI returned an empty response.'
-    );
+    // Flexible parsing to support common response field names
+    const aiText =
+      data?.response ||
+      data?.text ||
+      data?.result ||
+      data?.message ||
+      '⚠️ AI returned an empty response.';
 
-    await ctx.reply(aiText);
-    saveChatLog(userId, incomingText, aiText);
+    // Optional debug logging
+    console.log('[AI RESPONSE]', aiText);
+
+    await ctx.reply(String(aiText));
   } catch (error) {
-    console.error('Error happened:', error.message);
-    await ctx.reply('⚠️ Sorry, I could not process your request right now.');
+    console.error('Error while getting AI response:', error.message);
+    await ctx.reply('⚠️ Sorry, I could not get a response from the AI service right now.');
   }
 });
 
+// Start polling
 bot
   .launch()
   .then(() => {
-    console.log('Bot started');
+    console.log('✅ Telegram AI bot is running...');
   })
   .catch((error) => {
-    console.error('Error happened:', error.message);
+    console.error('Failed to launch bot:', error.message);
   });
 
+// Graceful shutdown handlers
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
