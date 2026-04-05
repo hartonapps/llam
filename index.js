@@ -127,6 +127,62 @@ function saveChatLog(userId, userText, aiText) {
   });
 }
 
+// Read a user's chat history from log file so it can be sent to AI context
+function getUserChatHistory(userId, maxChars = 6000) {
+  if (!userId) return '';
+
+  const logPath = path.join(logsDir, `chat_${userId}.log`);
+  if (!fs.existsSync(logPath)) return '';
+
+  try {
+    const fullLog = fs.readFileSync(logPath, 'utf8');
+    if (!fullLog) return '';
+
+    // Keep only the most recent section to avoid very large payloads
+    return fullLog.slice(-maxChars);
+  } catch (error) {
+    console.error(`Error reading chat history for ${userId}:`, error.message);
+    return '';
+  }
+}
+
+// Try to find an exact previous question in log and reuse its AI answer
+function findCachedAnswer(userId, question) {
+  if (!userId || !question) return null;
+
+  const logPath = path.join(logsDir, `chat_${userId}.log`);
+  if (!fs.existsSync(logPath)) return null;
+
+  try {
+    const text = fs.readFileSync(logPath, 'utf8');
+    const entries = text
+      .split('\n\n')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+    // Search newest first for efficiency
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const userMatch = entries[i].match(/User:\s*([\s\S]*?)\nAI:/);
+      const aiMatch = entries[i].match(/\nAI:\s*([\s\S]*)$/);
+
+      const previousUserText = userMatch?.[1]?.trim();
+      const previousAiText = aiMatch?.[1]?.trim();
+
+      if (
+        previousUserText &&
+        previousAiText &&
+        previousUserText.toLowerCase() === question.toLowerCase()
+      ) {
+        return previousAiText;
+      }
+    }
+  } catch (error) {
+    console.error(`Error reading cached answer for ${userId}:`, error.message);
+  }
+
+  return null;
+}
+
 ensureStorage();
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
@@ -273,14 +329,29 @@ bot.on('text', async (ctx) => {
   incrementUserMessageCount(userId);
 
   try {
+    // If same question exists in logs, reply instantly from cached history
+    const cachedAnswer = findCachedAnswer(userId, incomingText);
+    if (cachedAnswer) {
+      console.log(`Using cached answer from chat history for user ${userId}`);
+      await ctx.reply(cachedAnswer);
+      return;
+    }
+
     // Typing animation before request
     await ctx.sendChatAction('typing');
+
+    // Include previous chat history so AI can answer using earlier context
+    const chatHistory = getUserChatHistory(userId);
 
     console.log('Sending request to AI API...');
     const response = await fetch(AI_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: incomingText, userId: String(userId) })
+      body: JSON.stringify({
+        prompt: incomingText,
+        userId: String(userId),
+        chat_history: chatHistory
+      })
     });
 
     if (!response.ok) {
